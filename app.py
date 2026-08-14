@@ -33,6 +33,7 @@ async def set_starters():
     ]
  
  
+
 async def process_question(question: str):
     """
     Core pipeline: routing -> (SQL generation -> execution) or (direct followup)
@@ -41,16 +42,23 @@ async def process_question(question: str):
     Shared by both entry points: a typed message (@cl.on_message) and a
     clicked suggested-question button (@cl.action_callback) -- avoids
     duplicating this whole flow in two places.
+ 
+    Wrapped in a single outer try/except: this pipeline makes several
+    separate LLM calls (routing, SQL generation, reformulation), any of
+    which can fail if the selected provider is unreachable -- most
+    notably "llama" (local Ollama), which is only reachable when this
+    app runs on the developer's own machine, not once deployed to a
+    remote host like Render.
     """
     debut = time.time()
     provider = cl.user_session.get("provider")
     sql_history = cl.user_session.get("sql_history")
     chat_history = cl.user_session.get("chat_history")
  
-    decision = route_question(question, chat_history, provider)
+    try:
+        decision = route_question(question, chat_history, provider)
  
-    if decision == "SQL_NEEDED":
-        try:
+        if decision == "SQL_NEEDED":
             async with cl.Step(name="sql query") as step1:
                 context_note = build_context_note(chat_history)
                 sql_query = get_sql_query(question + context_note, provider, history=sql_history)
@@ -59,42 +67,54 @@ async def process_question(question: str):
             async with cl.Step(name="run query") as step2:
                 answer = run_query(sql_query)
                 step2.output = str(answer)
-        except Exception as e:
-            logging.error(f"Failed to process question '{question}': {e}")
+ 
+            async with cl.Step(name="response") as step3:
+                prompt_message = f"User question: {question}\nQuery results: {answer}"
+                if is_delay_query(sql_query):
+                    units = detect_delay_unit(sql_query)
+                    prompt_message += f", The delay values above are already expressed in {units}."
+ 
+                response = call_llm(EXPLANATION_PROMPT, prompt_message, provider, history=chat_history)
+                fin = time.time()
+                duree = fin - debut
+                step3.output = f"Response generated ({len(response)} characters in {duree:.2f} seconds)"
+ 
+            sql_history.append({"role": "user", "content": question})
+            sql_history.append({"role": "assistant", "content": sql_query})
+            cl.user_session.set("sql_history", sql_history)
+ 
+        else:  # FOLLOWUP
+            async with cl.Step(name="response") as step3:
+                response = call_llm(EXPLANATION_PROMPT, question, provider, history=chat_history)
+                fin = time.time()
+                duree = fin - debut
+                step3.output = f"Response generated ({len(response)} characters in {duree:.2f} seconds)"
+ 
+    except Exception as e:
+        logging.error(f"Failed to process question '{question}' with provider '{provider}': {e}")
+ 
+        if provider == "llama" and "Ollama" in str(e):
+            await cl.Message(
+                content=(
+                    "⚠️ **Llama (local)** is only reachable when running this app on your "
+                    "own machine with Ollama installed and running. Please switch to "
+                    "**Groq API** in the settings panel (⚙️) to continue."
+                )
+            ).send()
+        else:
             await cl.Message(
                 content="I couldn't process that question — could you rephrase it?"
             ).send()
-            return
- 
-        async with cl.Step(name="response") as step3:
-            prompt_message = f"User question: {question}\nQuery results: {answer}"
-            if is_delay_query(sql_query):
-                units = detect_delay_unit(sql_query)
-                prompt_message += f", The delay values above are already expressed in {units}."
- 
-            response = call_llm(EXPLANATION_PROMPT, prompt_message, provider, history=chat_history)
-            fin = time.time()
-            duree = fin - debut
-            step3.output = f"Response generated ({len(response)} characters in {duree:.2f} seconds)"
- 
-        sql_history.append({"role": "user", "content": question})
-        sql_history.append({"role": "assistant", "content": sql_query})
-        cl.user_session.set("sql_history", sql_history)
- 
-    else:  # FOLLOWUP
-        async with cl.Step(name="response") as step3:
-            response = call_llm(EXPLANATION_PROMPT, question, provider, history=chat_history)
-            fin = time.time()
-            duree = fin - debut
-            step3.output = f"Response generated ({len(response)} characters in {duree:.2f} seconds)"
+        return
  
     chat_history.append({"role": "user", "content": question})
     chat_history.append({"role": "assistant", "content": response})
     cl.user_session.set("chat_history", chat_history)
  
-    author = PROVIDER_DISPLAY_NAMES.get(provider, "RailPulse") 
+    author = PROVIDER_DISPLAY_NAMES.get(provider, "RailPulse")
     await cl.Message(content=response, author=author).send()
-    
+ 
+   
     
 @cl.on_chat_start
 async def start():
