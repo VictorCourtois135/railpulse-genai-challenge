@@ -10,6 +10,204 @@ This sprint adds a natural-language interface on top of the Sprint 2 Azure SQL d
 - **Ollama (`llama3:8b`)** — fully local, fully free, no API key, but noticeably less reliable at following strict formatting/logic rules
 - **Groq (`llama-3.3-70b-versatile`)** — free-tier cloud API, dramatically more consistent, chosen as the default since most stakeholders won't have a local model downloaded
 
+## 🚀 Live Demo
+
+**[https://railpulse-genai-challenge.onrender.com/](https://railpulse-genai-challenge.onrender.com/) — Live and confirmed working (Groq provider; see below for the Llama/local limitation).**
+
+Deployed via Docker on [Render](https://render.com) (free tier). A few things to know before trying it:
+
+- **Cold start**: the free tier sleeps after inactivity — the first message after a period of idle time can take 30-60 seconds to respond while the service wakes up.
+- **"Llama (local)" provider will not work on this deployment.** Ollama runs on `localhost` and only exists on the developer's own machine — selecting it here will show a clear in-app warning explaining this and suggesting you switch to Groq API instead, rather than crashing. To actually test the Llama provider, clone this repo and run it locally (see Setup below).
+- **Deployment quirks solved along the way**, worth knowing if you redeploy this yourself:
+  - `pyodbc` needs the ODBC Driver 18 for SQL Server installed at the OS level — this requires a **Docker** deployment (Render's native Python buildpack won't have it), see `Dockerfile`.
+  - As of Feb 2026, Microsoft's own Debian 12 package repo signing key still uses SHA-1, which current Debian security policy rejects by default — a known, still-open issue ([microsoft/linux-package-repositories#306](https://github.com/microsoft/linux-package-repositories/issues/306)). Worked around in the `Dockerfile` with `--allow-unauthenticated` for that specific repo (the download itself still happens over HTTPS).
+  - Azure SQL's firewall must explicitly allow the hosting platform's outbound IP — Render's IP was added as a firewall rule in the Azure Portal (Networking blade). This IP is not guaranteed stable long-term on a free tier; if the live demo starts failing with a `40615` firewall error, this is the first thing to check.
+
+## Architecture
+
+```
+User (Chainlit chat)
+        │
+        ▼
+┌─────────────────────┐
+│  Routing LLM call   │  ROUTING_PROMPT: classifies each      message as
+│  (route_question)   │  SQL_NEEDED (new data required) or FOLLOWUP
+└──────────┬──────────┘  (clarification on an already-given answer)
+           │
+     ┌─────┴─────┐
+     ▼           ▼
+SQL_NEEDED    FOLLOWUP
+     │           │
+     ▼           │
+┌─────────────┐  │
+│ Text-to-SQL │  │   SYSTEM_PROMPT: full schema, join paths, T-SQL
+│ (get_sql_   │  │   syntax rules, query-size limits
+│  query)     │  │
+└──────┬──────┘  │
+       ▼         │
+┌─────────────┐  │
+│ Safety check│  │   validate_query_safety(): blocks DROP/DELETE/
+│ + execution │  │   UPDATE/INSERT/ALTER/TRUNCATE/EXEC (case- and
+│ (run_query) │  │   word-boundary-safe regex), fetchmany(10) caps
+└──────┬──────┘  │   result volume regardless of what the SQL asked for
+       │         │
+       └─────┬───┘
+             ▼
+┌──────────────────────────┐
+│Consultant LLM call       │  EXPLANATION_PROMPT: tactical recommendation
+│(call_llm w/ chat_history)│  tone, grounding rule (never invent numbers),
+└──────────────────────────┘  unit handled via detect_delay_unit/is_delay_query
+             │
+             ▼
+     Chainlit UI (cl.Step per stage, chat history, provider switch)
+```
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `prompts.py` | All 3 prompts: `SYSTEM_PROMPT` (Text-to-SQL), `EXPLANATION_PROMPT` (consultant reformulation), `ROUTING_PROMPT` (SQL_NEEDED vs FOLLOWUP classifier) |
+| `functions.py` | Core pipeline: `call_llm`, `get_sql_query`, `run_query`, `clean_sql_response`, `validate_query_safety`, `detect_delay_unit`, `is_delay_query`, `route_question`, `build_context_note` |
+| `app.py` | Chainlit UI: provider selector, suggested-question Starters/Actions, per-provider avatars, per-message routing, visible processing steps, dual conversation history |
+| `test_functions.py` | Automated tests for every deterministic (non-LLM) guardrail |
+| `public/avatars/` | Per-provider avatar images (see UX section below for a naming gotcha to avoid) |
+
+## Setup
+
+### 1. Local model (Ollama)
+```bash
+# Install from https://ollama.com/download, then:
+ollama pull llama3:8b
+```
+Ollama runs an HTTP server on `localhost:11434` automatically once the app is open — no extra configuration needed for the Python client to reach it.
+
+### 2. Cloud model (Groq) — the default provider
+1. Create a free account at [console.groq.com](https://console.groq.com)
+2. Generate an API key
+3. Add it to `.env`:
+   ```
+   GROQ_API_KEY=your-key-here
+   ```
+
+### 3. Python environment
+A dedicated virtual environment is required (Chainlit's async stack was incompatible with Python 3.14 at the time of writing — Python 3.12 is used instead):
+```powershell
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install ollama groq pyodbc python-dotenv chainlit
+```
+
+### 4. Database connection
+Reuses the exact same Azure SQL + Service Principal authentication set up in Sprint 2 (`AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`, `AZURE_SQL_CLIENT_ID`, `AZURE_SQL_CLIENT_SECRET` in `.env`).
+
+### 5. Run
+```powershell
+chainlit run app.py -w
+```
+
+## Prompt Engineering
+
+Three prompts, each with a single, narrow responsibility (mixing them was tried and found to cause instruction conflicts — see Lessons Learned):
+
+- **`SYSTEM_PROMPT`**: full T-SQL schema (all 17 tables), exact join paths ("do not invent shortcuts"), explicit query-size limits (aggregate function OR `TOP 20`, always one of the two), and a strict rule that delay columns must stay in raw seconds (no `/60` in generated SQL — conversion happens downstream).
+- **`EXPLANATION_PROMPT`**: consultant tone and format (observation → implication → action, 3-5 sentences), a grounding rule forbidding invented numbers, and unit handling driven by what the calling code explicitly states (never assumed).
+- **`ROUTING_PROMPT`**: a lightweight few-shot classifier (5+ examples) that decides whether a message needs a new database query or can be answered from conversation history alone — includes explicit examples for date/period follow-ups, which were found to be misclassified without them.
+
+## Security Guardrails (deterministic, code-level — never trusted to the LLM alone)
+
+| Guardrail | What it protects against |
+|---|---|
+| `validate_query_safety()` | Blocks `DROP`/`DELETE`/`UPDATE`/`INSERT`/`ALTER`/`TRUNCATE`/`EXEC`, case-insensitive, word-boundary-safe (won't false-positive on e.g. `stop_id_updated`). Checked **before** opening a DB connection, so a blocked query never even reaches Azure SQL. |
+| `fetchmany(10)` | Caps result volume regardless of whether the generated SQL includes `TOP N` or not — a true guarantee, not just a prompt hint. |
+| `clean_sql_response()` | Strips preambles and Markdown code fences from the LLM's raw output before it's ever sent to the database. |
+| `detect_delay_unit()` / `is_delay_query()` | Inspects the generated SQL text itself (looking for `/60` and for `departure_delay`/`arrival_delay`) rather than trusting a fixed prompt assumption about units — prevents double-conversion or false "this is a delay" framing on non-delay queries (counts, percentages). |
+| `EXPLANATION_PROMPT` grounding rule | The one guardrail that is prompt-based, not code-based — mitigates (but does not 100% eliminate) the risk of the consultant LLM inventing a plausible-sounding number in FOLLOWUP mode, where no fresh SQL result exists to ground it. |
+
+All deterministic guardrails are covered by `test_functions.py`, including an end-to-end test that hand-writes real `DELETE`/`DROP`/`UPDATE` statements and confirms they never reach the database.
+
+## User Experience Enhancements
+
+Beyond the Must-Have chat portal, several usability layers were added:
+
+- **Suggested questions (dual mechanism)**: `@cl.set_starters` shows large clickable cards on a brand-new, empty conversation; `cl.Action` buttons attached to the welcome message keep the same suggestions available even after the welcome message has been sent (Starters disappear as soon as any message exists in the conversation — the two mechanisms cover both states).
+- **DRY refactor for the two entry points**: both a typed message (`@cl.on_message`) and a clicked suggestion button (`@cl.action_callback`) funnel into a single `process_question()` function, so the full pipeline (routing → SQL → execution → reformulation → history update) is written and maintained in exactly one place.
+- **Provider transparency**: the active LLM provider is announced in the welcome message, confirmed again on every settings change, and shown as the message author (with a matching avatar) on every response — so the user always knows whether Groq or local Llama answered.
+- **Processing steps (`cl.Step`)**: each stage (SQL generation, query execution, response generation) is shown as a collapsible card with live status, rather than a silent multi-second wait — includes the generated SQL and the total response time.
+
+
+## Lessons Learned (real bugs found and fixed during this sprint)
+
+- **`llama3:8b` is inconsistent, not just occasionally wrong.** The same prompt, run multiple times, produced different join paths, different adherence to the "no `/60` in SQL" rule, and different output formatting. This is precisely why every hard constraint (security, unit handling, result size) was pushed into Python code rather than left to prompt instructions alone — confirmed necessary by repeated observation, not assumed upfront.
+- **A single shared conversation history breaks two prompts with conflicting output rules.** `SYSTEM_PROMPT` demands "SQL only, nothing else"; `EXPLANATION_PROMPT` demands natural language. Two separate histories (`sql_history`, `chat_history`) were used instead of one.
+- **The routing/history split created a real data-loss bug.** A date range mentioned only in natural language (`chat_history`) was invisible to the SQL generator (which only sees `sql_history`), causing it to fabricate placeholder literals like `'date_debut'`. Fixed by `build_context_note()`, which injects the last few natural-language user turns into the SQL generation prompt.
+- **A misrouted FOLLOWUP is a silent hallucination risk, not just a wrong answer.** When the router incorrectly classified a new-data question as a follow-up, the consultant LLM invented a specific, plausible-looking delay figure with no query behind it at all — worse than a crash, because nothing signaled the number was fake. Addressed with the `EXPLANATION_PROMPT` grounding rule and improved `ROUTING_PROMPT` examples, though this remains a probabilistic mitigation, not an absolute guarantee.
+- **DAX-style computed metrics (Sprint 3 Power BI measures) do not exist in the database.** They live only in the `.pbix` file. The SQL-generation prompt had to re-encode the same business rules (on-time threshold, delay-in-seconds convention) directly in T-SQL terms.
+
+## Nice-to-Have Status
+
+| Feature | Status |
+|---|---|
+| Strict query validation (safety layer) | ✅ Done — see Security Guardrails above |
+| Dynamic Few-Shot Prompting | ✅ Done — applied in `ROUTING_PROMPT` (5+ examples) and `SYSTEM_PROMPT`'s `COMMON QUERY PATTERNS` |
+
+## Testing
+
+```bash
+python test_functions.py
+```
+Covers `clean_sql_response`, `validate_query_safety` (including case-insensitivity and false-positive avoidance), `detect_delay_unit`, and an end-to-end security test against `run_query` using hand-written destructive SQL.
+
+## Project Series — RailPulse Across 4 Sprints
+
+This project builds incrementally, each sprint on top of the last:
+
+| Sprint | Focus | Repository |
+|---|---|---|
+| **Sprint 1** | Local SQL foundations — SQLite database built from SNCB/NMBS GTFS static + real-time data, normalized schema, analytical SQL queries | *[add your Sprint 1 repo link here]* |
+| **Sprint 2** | Cloud migration — Azure SQL (serverless), Azure Function (HTTP + Timer triggers) for automated real-time ingestion, Service Principal authentication | *[add your Sprint 2 repo link here, e.g. `railpulse-challenge-azure`]* |
+| **Sprint 3** | Business intelligence — Power BI dashboard connected live to the Sprint 2 Azure SQL database: Punctuality Scorecard, Rush Hour Matrix, Train Class Breakdown, Platform Congestion Map | *[add your Sprint 3 repo/file link here]* |
+| **Sprint 4** (this repo) | Conversational AI — free, open-source LLM assistant (Ollama/Groq) with Text-to-SQL, security guardrails, and a Chainlit chat UI, deployed publicly | `railpulse-genai-challenge` (this repo) |
+
+Each sprint's database schema and lessons carry forward: the same Azure SQL tables from Sprint 2 power both the Sprint 3 dashboard and this sprint's AI assistant, and several data-quality findings from Sprint 1 (e.g. `wheelchair_accessible` never populated, `calendar.txt` entirely zeroed out) are still relevant context for interpreting any answer this assistant gives.
+
+## Timeline
+
+- **Sprint 1** — Local database & SQL analysis — *[dates]*
+- **Sprint 2** — Azure cloud migration & serverless ingestion — *[dates]*
+- **Sprint 3** — Power BI executive dashboard — *[dates]*
+- **Sprint 4** — Open-source GenAI assistant (this repo) — *[dates]*
+
+## Contributors
+
+**Victor Courtois**
+- GitHub: https://github.com/VictorCourtois135
+- LinkedIn: www.linkedin.com/in/victor-courtois-303690274
+
+# 🤖 RailPulse AI — Intelligent Transit Insights (Sprint 4)
+
+A conversational AI assistant, built entirely on **free, open-source LLMs**, that lets non-technical stakeholders ask natural-language questions about the RailPulse Azure SQL database and get back tactical, consultant-style recommendations — with zero third-party API costs.
+
+## Project Description
+
+This sprint adds a natural-language interface on top of the Sprint 2 Azure SQL database: a Streamlit/Chainlit chat where a station manager can type "Which platform at Brussels-Central had the worst average delay this morning?" and receive a real, grounded answer — generated by translating the question into SQL, executing it safely against the live database, and having an LLM reformulate the result as a short operational brief.
+
+**LLM providers, chosen by the user at runtime:**
+- **Ollama (`llama3:8b`)** — fully local, fully free, no API key, but noticeably less reliable at following strict formatting/logic rules
+- **Groq (`llama-3.3-70b-versatile`)** — free-tier cloud API, dramatically more consistent, chosen as the default since most stakeholders won't have a local model downloaded
+
+## 🚀 Live Demo
+
+**[https://railpulse-genai-challenge.onrender.com/](https://railpulse-genai-challenge.onrender.com/)**
+
+Deployed via Docker on [Render](https://render.com) (free tier). A few things to know before trying it:
+
+- **Cold start**: the free tier sleeps after inactivity — the first message after a period of idle time can take 30-60 seconds to respond while the service wakes up.
+- **"Llama (local)" provider will not work on this deployment.** Ollama runs on `localhost` and only exists on the developer's own machine — selecting it here will show a clear in-app warning explaining this and suggesting you switch to Groq API instead, rather than crashing. To actually test the Llama provider, clone this repo and run it locally (see Setup below).
+- **Deployment quirks solved along the way**, worth knowing if you redeploy this yourself:
+  - `pyodbc` needs the ODBC Driver 18 for SQL Server installed at the OS level — this requires a **Docker** deployment (Render's native Python buildpack won't have it), see `Dockerfile`.
+  - As of Feb 2026, Microsoft's own Debian 12 package repo signing key still uses SHA-1, which current Debian security policy rejects by default — a known, still-open issue ([microsoft/linux-package-repositories#306](https://github.com/microsoft/linux-package-repositories/issues/306)). Worked around in the `Dockerfile` with `--allow-unauthenticated` for that specific repo (the download itself still happens over HTTPS).
+  - Azure SQL's firewall must explicitly allow the hosting platform's outbound IP — Render's IP was added as a firewall rule in the Azure Portal (Networking blade). This IP is not guaranteed stable long-term on a free tier; if the live demo starts failing with a `40615` firewall error, this is the first thing to check.
+
 ## Architecture
 
 ```
@@ -121,6 +319,9 @@ Beyond the Must-Have chat portal, several usability layers were added:
 - **Provider transparency**: the active LLM provider is announced in the welcome message, confirmed again on every settings change, and shown as the message author (with a matching avatar) on every response — so the user always knows whether Groq or local Llama answered.
 - **Processing steps (`cl.Step`)**: each stage (SQL generation, query execution, response generation) is shown as a collapsible card with live status, rather than a silent multi-second wait — includes the generated SQL and the total response time.
 
+### Chainlit avatar naming gotcha (debugged this sprint)
+
+Chainlit matches a message's `author` string to a file in `public/avatars/` by exact name. Names containing certain character combinations (e.g. a digit immediately followed by a hyphen, as in `"Llama3-8b Local"`) silently fail to match — Chainlit falls back to a generic SVG icon instead of raising any error. The browser's Network tab showed a `200 OK` response of type `svg+xml`, not `png`, which was the actual signal that the real file was never found. Fixed by using a simple alphanumeric author name (`"Llama3"`) with no special characters. **Lesson**: a `200` response is not proof the intended asset loaded — check the response's content type, not just its status code.
 
 ## Lessons Learned (real bugs found and fixed during this sprint)
 
@@ -136,6 +337,7 @@ Beyond the Must-Have chat portal, several usability layers were added:
 |---|---|
 | Strict query validation (safety layer) | ✅ Done — see Security Guardrails above |
 | Dynamic Few-Shot Prompting | ✅ Done — applied in `ROUTING_PROMPT` (5+ examples) and `SYSTEM_PROMPT`'s `COMMON QUERY PATTERNS` |
+| Automated Weekly Report Generator | ⏳ Not yet started |
 
 ## Testing
 
@@ -143,6 +345,26 @@ Beyond the Must-Have chat portal, several usability layers were added:
 python test_functions.py
 ```
 Covers `clean_sql_response`, `validate_query_safety` (including case-insensitivity and false-positive avoidance), `detect_delay_unit`, and an end-to-end security test against `run_query` using hand-written destructive SQL.
+
+## Project Series — RailPulse Across 4 Sprints
+
+This project builds incrementally, each sprint on top of the last:
+
+| Sprint | Focus | Repository |
+|---|---|---|
+| **Sprint 1** | Local SQL foundations — SQLite database built from SNCB/NMBS GTFS static + real-time data, normalized schema, analytical SQL queries | *[add your Sprint 1 repo link here]* |
+| **Sprint 2** | Cloud migration — Azure SQL (serverless), Azure Function (HTTP + Timer triggers) for automated real-time ingestion, Service Principal authentication | *[add your Sprint 2 repo link here, e.g. `railpulse-challenge-azure`]* |
+| **Sprint 3** | Business intelligence — Power BI dashboard connected live to the Sprint 2 Azure SQL database: Punctuality Scorecard, Rush Hour Matrix, Train Class Breakdown, Platform Congestion Map | *[add your Sprint 3 repo/file link here]* |
+| **Sprint 4** (this repo) | Conversational AI — free, open-source LLM assistant (Ollama/Groq) with Text-to-SQL, security guardrails, and a Chainlit chat UI, deployed publicly | `railpulse-genai-challenge` (this repo) |
+
+Each sprint's database schema and lessons carry forward: the same Azure SQL tables from Sprint 2 power both the Sprint 3 dashboard and this sprint's AI assistant, and several data-quality findings from Sprint 1 (e.g. `wheelchair_accessible` never populated, `calendar.txt` entirely zeroed out) are still relevant context for interpreting any answer this assistant gives.
+
+## Timeline
+
+- **Sprint 1** — Local database & SQL analysis — *[dates]*
+- **Sprint 2** — Azure cloud migration & serverless ingestion — *[dates]*
+- **Sprint 3** — Power BI executive dashboard — *[dates]*
+- **Sprint 4** — Open-source GenAI assistant (this repo) — *[dates]*
 
 ## Contributors
 
