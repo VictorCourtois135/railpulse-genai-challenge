@@ -1,3 +1,5 @@
+# Dockerfile — RailPulse Chainlit app, deployable on Render (or any Docker host)
+
 FROM python:3.12-slim
 
 # --- Install the ODBC Driver 18 for SQL Server (needed by pyodbc to reach Azure SQL) ---
